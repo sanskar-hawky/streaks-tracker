@@ -6,7 +6,9 @@ import secrets as _secrets
 from datetime import date, timedelta
 from threading import Thread
 
-from flask import Flask, Response, abort, flash, jsonify, redirect, render_template, request, url_for
+from authlib.integrations.flask_client import OAuth
+from flask import Flask, Response, abort, flash, jsonify, redirect, render_template, request, session, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import config as cfg
 from data import store
@@ -21,24 +23,71 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY") or "streak-tracker-local-only"
+# Behind Coolify/Fly the app sits behind a TLS-terminating reverse proxy. Trust
+# the X-Forwarded-* headers so url_for(_external=True) builds https:// callback
+# URLs (Google OAuth rejects http:// redirect URIs for non-localhost hosts).
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 
-# Basic Auth gate — disabled when env vars are unset (local dev convenience).
-# In Fly.io we set STREAKS_AUTH_USER and STREAKS_AUTH_PASSWORD via `fly secrets`.
+# ---- Authentication ------------------------------------------------------
+# Three-tier gate, highest-priority first:
+#   1. Google OAuth (Option C) — when GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET
+#      are set. Only @hawky.ai (GOOGLE_ALLOWED_DOMAINS) emails may enter.
+#   2. HTTP Basic Auth — when STREAKS_AUTH_PASSWORD is set (legacy / simple).
+#   3. Open — neither configured (local dev convenience).
 _AUTH_USER = os.environ.get("STREAKS_AUTH_USER")
 _AUTH_PASSWORD = os.environ.get("STREAKS_AUTH_PASSWORD")
 _AUTH_REALM = 'Basic realm="streak-tracker", charset="UTF-8"'
+# Endpoints reachable without a session (the login dance + health check).
+_AUTH_EXEMPT_ENDPOINTS = {"healthz", "login", "auth_google", "auth_callback", "logout", "static"}
 _AUTH_EXEMPT_PATHS = {"/healthz"}
+
+oauth = OAuth(app)
+
+
+def _oauth_enabled():
+    return bool(cfg.GOOGLE_CLIENT_ID and cfg.GOOGLE_CLIENT_SECRET)
+
+
+if _oauth_enabled():
+    oauth.register(
+        name="google",
+        server_metadata_url=cfg.GOOGLE_DISCOVERY_URL,
+        client_id=cfg.GOOGLE_CLIENT_ID,
+        client_secret=cfg.GOOGLE_CLIENT_SECRET,
+        client_kwargs={"scope": "openid email profile"},
+    )
+
+
+def _email_allowed(email):
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        return False
+    if email in cfg.GOOGLE_ALLOWED_EMAILS:
+        return True
+    return email.rsplit("@", 1)[-1] in cfg.GOOGLE_ALLOWED_DOMAINS
 
 
 @app.before_request
-def _require_basic_auth():
-    if not _AUTH_PASSWORD:
-        return  # no password set → auth disabled (local dev)
-    if request.path in _AUTH_EXEMPT_PATHS:
+def _require_auth():
+    if request.endpoint in _AUTH_EXEMPT_ENDPOINTS or request.path in _AUTH_EXEMPT_PATHS:
         return
+
+    if _oauth_enabled():
+        if session.get("user"):
+            return
+        # Remember where the user was headed so we can bounce them back after
+        # login (GET navigations only — never replay a POST).
+        if request.method == "GET":
+            session["next"] = request.url
+        return redirect(url_for("login"))
+
+    # Fallback: HTTP Basic Auth.
+    if not _AUTH_PASSWORD:
+        return  # nothing configured → open (local dev)
     auth = request.authorization
     if (
         not auth
@@ -47,6 +96,66 @@ def _require_basic_auth():
         or not _secrets.compare_digest(auth.password or "", _AUTH_PASSWORD)
     ):
         return Response("Auth required", 401, {"WWW-Authenticate": _AUTH_REALM})
+
+
+@app.route("/login")
+def login():
+    if not _oauth_enabled():
+        # No Google config → there's nothing to log into; send them home (the
+        # Basic Auth / open gate handles access in that mode).
+        return redirect(url_for("index"))
+    if session.get("user"):
+        return redirect(url_for("index"))
+    # Render OUR branded sign-in page. The "Sign in with Google" button on it
+    # points at /auth/google, which is what actually starts the OAuth redirect.
+    return render_template("login.html")
+
+
+@app.route("/auth/google")
+def auth_google():
+    if not _oauth_enabled():
+        return redirect(url_for("index"))
+    redirect_uri = url_for("auth_callback", _external=True)
+    # `hd` nudges Google's account picker toward the org domain (single-domain
+    # setups only). It's a hint, not a guarantee — we re-verify server-side.
+    kwargs = {}
+    if len(cfg.GOOGLE_ALLOWED_DOMAINS) == 1:
+        kwargs["hd"] = next(iter(cfg.GOOGLE_ALLOWED_DOMAINS))
+    return oauth.google.authorize_redirect(redirect_uri, **kwargs)
+
+
+@app.route("/auth/callback")
+def auth_callback():
+    if not _oauth_enabled():
+        return redirect(url_for("index"))
+    try:
+        token = oauth.google.authorize_access_token()
+    except Exception:
+        log.exception("OAuth token exchange failed")
+        return render_template("login.html", error="Sign-in failed. Please try again."), 400
+    userinfo = token.get("userinfo") or {}
+    email = (userinfo.get("email") or "").strip().lower()
+    if not userinfo.get("email_verified", False) or not _email_allowed(email):
+        session.pop("user", None)
+        allowed = ", ".join(sorted(cfg.GOOGLE_ALLOWED_DOMAINS)) or "an authorized"
+        return render_template(
+            "login.html",
+            error=f"{email or 'That account'} isn't allowed. Sign in with your @{allowed} account.",
+        ), 403
+    session["user"] = {
+        "email": email,
+        "name": userinfo.get("name"),
+        "picture": userinfo.get("picture"),
+    }
+    session.permanent = True
+    dest = session.pop("next", None) or url_for("index")
+    return redirect(dest)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login") if _oauth_enabled() else url_for("index"))
 
 
 @app.route("/healthz")

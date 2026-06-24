@@ -41,6 +41,29 @@ DEFAULT_PRODUCT_BASE_URL = os.environ.get(
 )
 
 
+# --- Google OAuth (Option C: SSO restricted to @hawky.ai) -----------------
+# When GOOGLE_CLIENT_ID + GOOGLE_CLIENT_SECRET are set, the dashboard is gated
+# behind "Sign in with Google" and only emails whose domain is in
+# GOOGLE_ALLOWED_DOMAINS (or that appear verbatim in GOOGLE_ALLOWED_EMAILS) may
+# enter. When unset, the app falls back to HTTP Basic Auth (STREAKS_AUTH_*),
+# then to open access (local dev). NEVER commit the secret — set it via .env
+# (local) or the Coolify/host env (prod).
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET")
+GOOGLE_ALLOWED_DOMAINS = {
+    d.strip().lower()
+    for d in os.environ.get("GOOGLE_ALLOWED_DOMAINS", "hawky.ai").split(",")
+    if d.strip()
+}
+# Optional per-email exceptions (e.g. a contractor on a non-hawky.ai address).
+GOOGLE_ALLOWED_EMAILS = {
+    e.strip().lower()
+    for e in os.environ.get("GOOGLE_ALLOWED_EMAILS", "").split(",")
+    if e.strip()
+}
+GOOGLE_DISCOVERY_URL = "https://accounts.google.com/.well-known/openid-configuration"
+
+
 DEFAULT_REFRESH_MIN = 15
 DEFAULT_DAY_WINDOW = 21
 DEFAULT_WEEKEND_DAYS = "5,6"  # Python weekday(): 5=Sat, 6=Sun

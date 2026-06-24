@@ -3,3 +3,4 @@ requests>=2.31
 python-dotenv>=1.0
 gunicorn>=21.0
 pymongo>=4.6
+Authlib>=1.3

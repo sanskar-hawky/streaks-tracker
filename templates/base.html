@@ -141,6 +141,14 @@
                 class="px-3 py-1.5 rounded-card bg-coral text-white hover:bg-coral-hover text-xs font-medium">
           Refresh now
         </button>
+        {% if session.user %}
+        <span class="hidden md:inline text-ink-400 pl-2 border-l border-surf-200 ml-1"
+              title="{{ session.user.email }}">{{ session.user.email }}</span>
+        <a href="{{ url_for('logout') }}"
+           class="px-3 py-1.5 rounded-card border border-surf-200 hover:bg-surf-100 text-xs font-medium text-ink-600">
+          Sign out
+        </a>
+        {% endif %}
       </div>
     </div>
     {% if last_run and (last_run.actual_to or last_run.error) %}
